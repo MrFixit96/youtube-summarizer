@@ -1,0 +1,935 @@
+"""
+Module for generating summaries from transcribed text using modern summarization models.
+"""
+
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+import logging
+import re
+import os
+from src.config.settings import LOCAL_MODEL_NAME, DEVICE
+
+# Configure logger
+logger = logging.getLogger('youtube_summarizer')
+
+class SummaryGenerator:
+    def __init__(self, model_name=None):
+        """
+        Initialize the SummaryGenerator.
+        
+        Args:
+            model_name (str): Hugging Face model to use for summarization
+                              Default options include 'google/flan-t5-large' or 'facebook/bart-large-cnn'
+        """
+        # Default to a modern summarization model with good long-text handling
+        self.model_name = model_name or LOCAL_MODEL_NAME
+        
+        # Model map for common summarization models
+        model_map = {
+            'bart-large-cnn': 'facebook/bart-large-cnn',
+            'bart-large-xsum': 'facebook/bart-large-xsum',
+            'flan-t5-base': 'google/flan-t5-base',
+            'flan-t5-large': 'google/flan-t5-large',
+            'flan-t5-xl': 'google/flan-t5-xl',
+            'pegasus': 'google/pegasus-xsum',
+            'pegasus-large': 'google/pegasus-large',
+            'long-t5': 'google/long-t5-tglobal-base',
+        }
+        
+        # Convert simple model name to full HF model ID if needed
+        if '/' not in self.model_name and self.model_name in model_map:
+            self.model_name = model_map[self.model_name]
+            
+        self.device = DEVICE
+        logger.info(f"Using summarization model: {self.model_name}")
+        
+    def generate_summary(self, transcript, max_chunk_length=1000, max_summary_length=150):
+        """
+        Generate a summary of the transcribed text using advanced prompting techniques.
+        
+        Args:
+            transcript (str): Transcribed text
+            max_chunk_length (int): Maximum length of text to process at once
+            max_summary_length (int): Maximum length of the generated summary
+            
+        Returns:
+            str: Generated summary
+        """
+        try:
+            # Clean the transcript
+            transcript = transcript.strip()
+            if not transcript:
+                return "No text to summarize."
+                
+            logger.info(f"Generating summary from transcript ({len(transcript.split())} words)")
+            
+            # Initialize the summarization pipeline
+            logger.info(f"Creating summarization pipeline with model: {self.model_name}")
+            summarizer = pipeline(
+                "summarization",
+                model=self.model_name,
+                device=0 if self.device == "cuda" else -1,
+                torch_dtype=torch.float32  # Use float32 for better compatibility
+            )
+            
+            # Split the transcript into chunks if it's too long
+            words = transcript.split()
+            chunks = []
+            current_chunk = []
+            current_length = 0
+            
+            chunk_size = self._determine_optimal_chunk_size(self.model_name, max_chunk_length)
+            logger.info(f"Using chunk size of {chunk_size} words")
+            
+            for word in words:
+                if current_length + 1 > chunk_size:
+                    chunks.append(" ".join(current_chunk))
+                    current_chunk = [word]
+                    current_length = 1
+                else:
+                    current_chunk.append(word)
+                    current_length += 1
+                    
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+            
+            logger.info(f"Split transcript into {len(chunks)} chunks")
+            
+            # Try a direct, clear approach with "flan-t5" models which are instruction-tuned
+            if "flan-t5" in self.model_name.lower():
+                try:
+                    logger.info("Using direct instruction approach for flan-t5 model")
+                    
+                    # For smaller chunks, use the first 2 chunks; for larger chunks, just the first one
+                    context_chunk = " ".join(chunks[:min(2, len(chunks))])
+                    
+                    direct_prompt = f"""# Expert YouTube Video Content Summarizer
+
+## Context
+You are analyzing a transcript extracted from a YouTube video. Your task is to create a comprehensive, informative summary that captures the essence of what this video teaches and communicates.
+
+## Transcript Content
+```
+{context_chunk}
+```
+
+## Guidelines for Summary Creation
+1. Provide a clear, detailed summary that captures the main topic, key points, and valuable insights
+2. Focus exclusively on factual content - omit all meta-references, formatting markers, or structural elements
+3. Write in cohesive paragraphs with proper transitions between ideas
+4. Highlight specific technologies, techniques, or concepts discussed, along with their practical applications
+5. Maintain an informative, educational tone appropriate for the video's subject matter
+6. AVOID phrases like "this video," "in this tutorial," or any references to the video format itself
+7. Focus on answering: What is the core message? What would someone learn? What are the key takeaways?
+
+## Output Format
+Produce a concise but comprehensive summary that someone could read to understand the video's content without watching it. Aim for clarity, accuracy, and completeness."""
+
+                    try:
+                        result = summarizer(
+                            direct_prompt,
+                            max_length=max(300, max_summary_length * 2),
+                            min_length=max(150, max_summary_length),
+                            do_sample=False,
+                            truncation=True
+                        )
+                        
+                        summary = result[0]['summary_text']
+                        logger.info("Successfully generated summary with direct instruction approach")
+                        
+                        # Debug log the summary
+                        logger.info(f"Summary length before cleaning: {len(summary)} chars")
+                        
+                        # Clean the summary of any remaining artifacts
+                        cleaned_summary = self._clean_summary(summary)
+                        logger.info(f"Summary length after cleaning: {len(cleaned_summary)} chars")
+                        
+                        if not cleaned_summary:
+                            logger.warning("Warning: Cleaned summary is empty! Using original summary.")
+                            cleaned_summary = summary
+                        
+                        return cleaned_summary
+                    except Exception as e:
+                        logger.warning(f"Direct instruction generation failed: {str(e)}")
+                        # Continue to next approach
+                    
+                except Exception as e:
+                    logger.warning(f"Direct instruction approach failed: {str(e)}")
+                    logger.info("Falling back to Tree-of-Thought approach")
+            
+            # Try Tree-of-Thought approach
+            try:
+                logger.info("Applying Tree-of-Thought approach for summarization")
+                
+                # First, identify key perspectives to analyze the content from
+                perspectives_prompt = f"""# Video Content Analysis Framework
+
+## Task Description
+Analyze this YouTube video transcript to identify the 3 most significant aspects of the content from different analytical perspectives.
+
+## Source Material
+Transcript excerpt: 
+```
+{transcript[:1500]}
+```
+
+## Analysis Requirements
+Identify and clearly articulate the following key aspects:
+
+1. Technology/Feature Identification: What specific technology, feature, or methodology is being presented as the primary subject?
+
+2. Implementation & Demonstration: What practical demonstrations, examples, or implementations are shown to illustrate the main concepts?
+
+3. Problem-Solution Analysis: What specific problems or challenges does this technology/approach solve, and what benefits does it provide?
+
+Provide these 3 key aspects in a clear, structured format without additional commentary."""
+
+                try:
+                    perspectives_result = summarizer(
+                        perspectives_prompt,
+                        max_length=100,
+                        min_length=30,
+                        do_sample=False,
+                        truncation=True
+                    )
+                    
+                    # Get the summary text regardless of format
+                    if isinstance(perspectives_result, list) and len(perspectives_result) > 0:
+                        perspectives = perspectives_result[0]['summary_text'] if isinstance(perspectives_result[0], dict) and 'summary_text' in perspectives_result[0] else str(perspectives_result[0])
+                    elif isinstance(perspectives_result, dict) and 'summary_text' in perspectives_result:
+                        perspectives = perspectives_result['summary_text']
+                    else:
+                        perspectives = str(perspectives_result)
+                        
+                    logger.info(f"Generated analysis perspectives: {perspectives}")
+                    
+                    # Extract clear perspective statements
+                    perspective_list = []
+                    for line in perspectives.split('\n'):
+                        line = line.strip()
+                        if line and (line.startswith('1.') or line.startswith('2.') or line.startswith('3.') or 
+                                    line.startswith('-') or line.startswith('•')):
+                            clean_line = line.lstrip('123456789.-• ')
+                            if clean_line:
+                                perspective_list.append(clean_line)
+                    
+                    # If no clear perspectives were extracted, create default ones
+                    if not perspective_list or len(perspective_list) < 2:
+                        perspective_list = [
+                            "Main technology or feature",
+                            "Practical demonstrations",
+                            "Benefits and use cases"
+                        ]
+                    
+                    # Process each perspective
+                    perspective_summaries = []
+                    actual_successful_summaries = 0  # Track genuinely successful summaries
+                    
+                    for i, perspective in enumerate(perspective_list):
+                        logger.info(f"Generating summary for perspective {i+1}: {perspective}")
+                        
+                        perspective_prompt = f"""# Expert Content Analyst
+
+## Analytical Focus
+You are analyzing a specific aspect of a video transcript: "{perspective}"
+
+## Source Material
+```
+{' '.join(chunks[:min(2, len(chunks))])}
+```
+
+## Task Description
+Provide a detailed, factual analysis focusing exclusively on the aspect mentioned above. 
+
+## Requirements
+1. Focus solely on extracting and synthesizing information about "{perspective}"
+2. Provide specific details, examples, and context from the transcript
+3. Present information in a clear, concise paragraph format
+4. Omit any meta-references (like "in this video" or "the transcript shows")
+5. Avoid introducing speculation or information not present in the source
+6. Maintain an objective, informative tone throughout
+
+## Output
+Produce a cohesive paragraph that thoroughly analyzes this specific aspect of the content."""
+
+                        try:
+                            # Fix the index out of range error by modifying how we call the model
+                            result = summarizer(
+                                perspective_prompt,
+                                max_length=120,
+                                min_length=30,
+                                do_sample=False
+                            )
+                            
+                            # Debug the raw result to understand its structure
+                            logger.info(f"Debug - Raw result type: {type(result)}")
+                            logger.info(f"Debug - Raw result content: {str(result)}")
+                            
+                            # Handle different possible return formats with safer access
+                            perspective_summary = ""
+                            
+                            # Extract the summary text - BART typically returns a list with a dict
+                            if isinstance(result, list) and len(result) > 0:
+                                perspective_summary = result[0]['summary_text']
+                            # If it's already a dict with summary_text
+                            elif isinstance(result, dict) and 'summary_text' in result:
+                                perspective_summary = result['summary_text']
+                            # If it's just a string
+                            elif isinstance(result, str):
+                                perspective_summary = result
+                            else:
+                                # As a last resort, convert to string
+                                perspective_summary = str(result)
+                            
+                            # Check that we got a useful summary
+                            if perspective_summary and len(perspective_summary) > 20:
+                                logger.info(f"Generated perspective summary ({len(perspective_summary)} chars)")
+                                logger.info(f"Summary preview: {perspective_summary[:100]}...")
+                                perspective_summaries.append(perspective_summary)
+                                actual_successful_summaries += 1
+                            else:
+                                # Create a fallback if the generated summary is too short or empty
+                                logger.warning(f"Generated summary for perspective '{perspective}' is too short or empty")
+                                perspective_summary = f"Information about {perspective} from the video."
+                                perspective_summaries.append(perspective_summary)
+                        except Exception as e:
+                            logger.warning(f"Error summarizing perspective '{perspective}': {str(e)}")
+                            # Add a basic fallback summary instead of skipping
+                            perspective_summary = f"Information about {perspective} from the video."
+                            perspective_summaries.append(perspective_summary)
+                            continue
+                    
+                    # Combine perspective summaries into a coherent final summary - AFTER the loop
+                    # Only proceed with Tree-of-Thought if we have REAL summaries, not just fallbacks
+                    if perspective_summaries and actual_successful_summaries >= 2:
+                        logger.info(f"Successfully generated {actual_successful_summaries} real perspective summaries")
+                        
+                        # Combine the perspective summaries and generate the final summary
+                        combined_perspectives = " ".join(perspective_summaries)
+                        
+                        final_prompt = f"""# Professional Content Synthesizer
+
+## Source Material
+The following are focused analyses of different aspects of a YouTube video:
+
+```
+{combined_perspectives}
+```
+
+## Task
+Synthesize these analytical perspectives into a cohesive, comprehensive summary of the entire video content.
+
+## Requirements
+1. Create a unified, flowing narrative that integrates all the provided analytical perspectives
+2. Structure the summary in proper paragraphs with logical flow and transitions
+3. Maintain factual accuracy and the specific details from each perspective
+4. Eliminate any redundancy while preserving important information from each section
+5. AVOID meta-references such as "this video shows" or "in this tutorial"
+6. Focus exclusively on the actual informational content
+7. DO NOT include formatting instructions, bullet points, numbering, or structural markers
+
+## Output Format
+Produce a polished, professional summary that reads as a standalone piece of content, not as a description of a video."""
+
+                        try:
+                            final_result = summarizer(
+                                final_prompt,
+                                max_length=max(250, max_summary_length * 2),
+                                min_length=max(150, max_summary_length),
+                                do_sample=False
+                            )
+                            
+                            # Debug the final result to understand its structure
+                            logger.info(f"Debug - Raw final result type: {type(final_result)}")
+                            logger.info(f"Debug - Raw final result content: {str(final_result)[:200]}")
+                            
+                            # Extract the summary text safely
+                            if isinstance(final_result, list) and len(final_result) > 0:
+                                if isinstance(final_result[0], dict) and 'summary_text' in final_result[0]:
+                                    final_summary = final_result[0]['summary_text']
+                                else:
+                                    final_summary = str(final_result[0])
+                            elif isinstance(final_result, dict) and 'summary_text' in final_result:
+                                final_summary = final_result['summary_text']
+                            else:
+                                final_summary = str(final_result)
+                                
+                            logger.info("Final summary generated using Tree-of-Thought approach")
+                            
+                            # Debug log the summary 
+                            logger.info(f"Summary length before cleaning: {len(final_summary)} chars")
+                            
+                            # Clean the summary before returning
+                            cleaned_summary = self._clean_summary(final_summary)
+                            logger.info(f"Summary length after cleaning: {len(cleaned_summary)} chars")
+                            
+                            if not cleaned_summary:
+                                logger.warning("Warning: Cleaned summary is empty! Using original summary.")
+                                cleaned_summary = final_summary
+                                
+                            return cleaned_summary
+                        except Exception as e:
+                            logger.warning(f"Final summary generation failed: {str(e)}")
+                            # Continue to next approach
+                    else:
+                        logger.warning("No perspective summaries were generated, falling back to next approach")
+                    
+                except Exception as tot_error:
+                    logger.warning(f"Tree-of-Thought approach failed: {str(tot_error)}")
+                    logger.info("Falling back to Skeleton-of-Thought approach")
+                
+            # Try Skeleton-of-Thought approach as a fallback
+            try:
+                logger.info("Applying Skeleton-of-Thought approach for summarization")
+                skeleton_prompt = f"""# Content Structure Analyst
+
+## Task
+Identify the 3-4 main topics covered in this YouTube video transcript. Focus on extracting the core structural elements.
+
+## Source Material
+```
+{transcript[:2000] + '...' if len(transcript) > 2000 else transcript}
+```
+
+## Instructions
+1. Analyze the transcript to identify the primary topics or sections
+2. List ONLY the main topics - avoid explanations or commentary
+3. Each topic should represent a significant portion of the content
+4. Focus on subject matter, not video structure (avoid topics like "introduction" or "conclusion")
+5. Be specific about technologies, concepts, or techniques discussed
+
+## Output Format
+Provide a simple list of the 3-4 main topics, with each topic expressed in a clear, concise phrase."""
+
+                skeleton_result = summarizer(
+                    skeleton_prompt,
+                    max_length=100,
+                    min_length=30,
+                    do_sample=False,
+                    truncation=True
+                )
+                
+                # Log the actual structure of the result for debugging
+                logger.info(f"Skeleton result type: {type(skeleton_result)}")
+                logger.info(f"Skeleton result structure: {str(skeleton_result)[:200]}")
+                
+                # Handle different possible return formats with safer access
+                if isinstance(skeleton_result, list) and len(skeleton_result) > 0:
+                    if isinstance(skeleton_result[0], dict) and 'summary_text' in skeleton_result[0]:
+                        skeleton = skeleton_result[0]['summary_text']
+                    else:
+                        skeleton = str(skeleton_result[0])
+                elif isinstance(skeleton_result, dict) and 'summary_text' in skeleton_result:
+                    skeleton = skeleton_result['summary_text']
+                elif isinstance(skeleton_result, str):
+                    skeleton = skeleton_result
+                else:
+                    skeleton = str(skeleton_result)
+                    
+                logger.info(f"Generated skeleton outline: {skeleton}")
+                
+                # Extract the main topics from the skeleton
+                topics = []
+                for line in skeleton.split('\n'):
+                    line = line.strip()
+                    if line.startswith('-') or line.startswith('*') or (line and line[0].isdigit() and '.' in line[:3]):
+                        topics.append(line.lstrip('- *0123456789. '))
+                    elif len(line) > 10:  # If not in a list format but substantial content
+                        topics.append(line)
+                
+                # If still no topics, try splitting by periods or commas
+                if not topics:
+                    for item in re.split(r'[.,;]', skeleton):
+                        item = item.strip()
+                        if len(item) > 10:
+                            topics.append(item)
+                    topics = topics[:4]  # Limit to 4 topics
+                
+                logger.info(f"Extracted {len(topics)} main topics from skeleton")
+                
+                # Generate detailed summaries for each topic
+                topic_summaries = []
+                actual_successful_topic_summaries = 0  # Track genuinely successful summaries
+                
+                for i, topic in enumerate(topics):
+                    if not topic:
+                        continue
+                        
+                    logger.info(f"Generating detailed summary for topic {i+1}: {topic}")
+                    
+                    topic_prompt = f"""# Topic-Focused Content Analyst
+
+## Analysis Focus
+You are analyzing information about the topic: "{topic}" from a video transcript.
+
+## Source Material
+```
+{' '.join(chunks)}
+```
+
+## Task
+Extract and synthesize all relevant information about "{topic}" from the transcript.
+
+## Requirements
+1. Focus exclusively on content related to "{topic}"
+2. Include specific details, examples, explanations, and context
+3. Structure the information in a cohesive paragraph format
+4. Maintain factual accuracy based strictly on the transcript content
+5. Avoid meta-references to the video format
+6. Do not include formatting instructions or structural markers
+
+## Output
+Create a detailed, informative paragraph that fully explains this topic as presented in the transcript."""
+
+                    try:
+                        # Fix the index out of range error by modifying how we call the model
+                        result = summarizer(
+                            topic_prompt,
+                            max_length=120,
+                            min_length=30,
+                            do_sample=False
+                        )
+                        
+                        # Debug the raw result to understand its structure
+                        logger.info(f"Debug - Raw topic result type: {type(result)}")
+                        logger.info(f"Debug - Raw topic result content: {str(result)}")
+                        
+                        # Handle different possible return formats with safer access
+                        topic_summary = ""
+                        
+                        # Extract the summary text - BART typically returns a list with a dict
+                        if isinstance(result, list) and len(result) > 0:
+                            topic_summary = result[0]['summary_text']
+                        # If it's already a dict with summary_text
+                        elif isinstance(result, dict) and 'summary_text' in result:
+                            topic_summary = result['summary_text']
+                        # If it's just a string
+                        elif isinstance(result, str):
+                            topic_summary = result
+                        else:
+                            # As a last resort, convert to string
+                            topic_summary = str(result)
+                        
+                        # Check that we got a useful summary
+                        if topic_summary and len(topic_summary) > 20 and "Empty result" not in topic_summary and "Information about" not in topic_summary:
+                            logger.info(f"Generated topic summary: {len(topic_summary)} chars")
+                            logger.info(f"Summary preview: {topic_summary[:100]}...")  # Log the start of the summary for debugging
+                            actual_successful_topic_summaries += 1
+                            topic_summaries.append(topic_summary)
+                        else:
+                            # Create a fallback if the generated summary is too short or empty
+                            logger.warning(f"Generated summary for topic '{topic}' appears to be a placeholder or empty")
+                            topic_summary = f"Information about {topic} from the video."
+                            topic_summaries.append(topic_summary)
+                    except Exception as e:
+                        logger.warning(f"Error summarizing topic '{topic}': {str(e)}")
+                        # Add a fallback summary
+                        topic_summary = f"Information about {topic} from the video."
+                        topic_summaries.append(topic_summary)
+                        continue
+                
+                # Combine topic summaries into a coherent final summary - AFTER the loop
+                # Only proceed with Skeleton-of-Thought if we have REAL summaries, not just fallbacks
+                if topic_summaries and actual_successful_topic_summaries >= 1:
+                    logger.info(f"Successfully generated {actual_successful_topic_summaries} real topic summaries")
+                    
+                    # Combine the topic summaries and generate the final summary
+                    combined_topics = " ".join(topic_summaries)
+                    
+                    final_prompt = f"""# Professional Content Integrator
+
+## Source Material
+The following are focused analyses of different topics from a YouTube video:
+
+```
+{combined_topics}
+```
+
+## Task
+Integrate these topic-focused analyses into a unified, comprehensive summary of the entire video content.
+
+## Requirements
+1. Create a cohesive narrative that flows naturally between the different topics
+2. Maintain the factual details and important points from each topic analysis
+3. Structure the content in proper paragraphs with logical transitions
+4. Eliminate redundancy while preserving important information
+5. Use a clear, professional writing style with proper grammar and syntax
+6. DO NOT include any bullet points, numbering, headings, or structural markers
+7. AVOID meta-references (like "this video shows" or "in this tutorial")
+8. Focus exclusively on the information content
+
+## Output Format
+Produce a polished, standalone summary that presents the video's content clearly and comprehensively."""
+
+                    try:
+                        final_result = summarizer(
+                            final_prompt,
+                            max_length=max(250, max_summary_length * 2),
+                            min_length=max(150, max_summary_length),
+                            do_sample=False
+                        )
+                        
+                        # Debug the final result to understand its structure
+                        logger.info(f"Debug - Raw final skeleton result type: {type(final_result)}")
+                        logger.info(f"Debug - Raw final skeleton result content: {str(final_result)[:200]}")
+                        
+                        # Extract the summary text safely
+                        if isinstance(final_result, list) and len(final_result) > 0:
+                            if isinstance(final_result[0], dict) and 'summary_text' in final_result[0]:
+                                final_summary = final_result[0]['summary_text']
+                            else:
+                                final_summary = str(final_result[0])
+                        elif isinstance(final_result, dict) and 'summary_text' in final_result:
+                            final_summary = final_result['summary_text']
+                        else:
+                            final_summary = str(final_result)
+                            
+                        logger.info("Final summary generated using Skeleton-of-Thought approach")
+                        
+                        # Debug log the summary
+                        logger.info(f"Summary length before cleaning: {len(final_summary)} chars")
+                        
+                        # Clean the summary before returning
+                        cleaned_summary = self._clean_summary(final_summary)
+                        logger.info(f"Summary length after cleaning: {len(cleaned_summary)} chars")
+                        
+                        if not cleaned_summary:
+                            logger.warning("Warning: Cleaned summary is empty! Using original summary.")
+                            cleaned_summary = final_summary
+                            
+                        return cleaned_summary
+                    except Exception as e:
+                        logger.warning(f"Final skeleton summary generation failed: {str(e)}")
+                        # Continue to next approach
+                else:
+                    logger.warning("No valid topic summaries were generated, falling back to next approach")
+                
+            except Exception as skeleton_error:
+                logger.warning(f"Skeleton-of-Thought approach failed: {str(skeleton_error)}")
+                logger.info("Falling back to standard summarization approach")
+            
+            # Fallback to chunk-based summarization as last resort
+            # Generate summaries for each chunk
+            chunk_summaries = []
+            
+            for i, chunk in enumerate(chunks):
+                logger.info(f"Summarizing chunk {i+1}/{len(chunks)}...")
+                
+                # Skip empty or very short chunks
+                if len(chunk.strip().split()) < 30:
+                    logger.info(f"Chunk {i+1} is too short, skipping.")
+                    continue
+                
+                # Different prompt formats for different model types
+                if "flan-t5" in self.model_name.lower():
+                    # Use clear instruction-based prompting
+                    prompt = f"""# Content Chunk Summarizer
+
+## Source Material
+```
+{chunk}
+```
+
+## Task
+Summarize this portion of a YouTube video transcript into a clear, accurate paragraph.
+
+## Requirements
+1. Extract the key information, main points, and important details
+2. Present the content in a cohesive paragraph format
+3. Maintain factual accuracy based strictly on the provided text
+4. Use complete sentences with proper grammar and transitions
+5. DO NOT include phrases like "this video explains" or any references to the video format
+6. Focus exclusively on the actual informational content
+
+## Output
+Create a concise but comprehensive summary of this content section."""
+
+                elif "t5" in self.model_name.lower():
+                    # Standard T5 prompt
+                    prompt = f"summarize: {chunk}"
+                else:
+                    # For BART and other models
+                    prompt = chunk
+                    
+                # Generate summary with proper error handling
+                try:
+                    summary = summarizer(
+                        prompt,
+                        max_length=max_summary_length,
+                        min_length=30,
+                        do_sample=False,
+                        truncation=True
+                    )
+                    chunk_summaries.append(summary[0]['summary_text'])
+                    
+                except Exception as chunk_error:
+                    logger.warning(f"Error summarizing chunk {i+1}: {str(chunk_error)}")
+                    # Try with more conservative parameters
+                    try:
+                        logger.info("Retrying with more conservative parameters...")
+                        summary = summarizer(
+                            chunk[:2000] if len(chunk) > 2000 else chunk,  # Take first 2000 chars only if needed
+                            max_length=max_summary_length // 2,
+                            min_length=20,
+                            do_sample=False,
+                            truncation=True
+                        )
+                        chunk_summaries.append(summary[0]['summary_text'])
+                    except Exception as retry_error:
+                        logger.error(f"Retry failed: {str(retry_error)}")
+                        # Skip this chunk but continue with others
+                        continue
+            
+            # If there are multiple summaries, combine them
+            if len(chunk_summaries) > 1:
+                logger.info(f"Combining {len(chunk_summaries)} chunk summaries")
+                
+                # For T5 models, we can do a second-level summarization for better coherence
+                if "t5" in self.model_name.lower():
+                    try:
+                        # Just join the summaries without markers that could leak into the final output
+                        combined_summaries = " ".join(chunk_summaries)
+                        logger.info("Creating a cohesive summary from all chunks")
+                        
+                        # Create the second-level summarization prompt
+                        if "flan-t5" in self.model_name.lower():
+                            prompt = f"""# Multi-Section Content Integrator
+
+## Source Material
+The following are summaries of different sections of a YouTube video:
+
+```
+{combined_summaries}
+```
+
+## Task
+Integrate these section summaries into a unified, comprehensive summary of the entire video content.
+
+## Requirements
+1. Create a cohesive narrative that flows naturally between the different sections
+2. Eliminate redundancy while preserving important information from each section
+3. Structure the content in proper paragraphs with logical transitions
+4. Use clear, concise language that accurately represents the original content
+5. DO NOT include any bullet points, numbering, or structural markers
+6. AVOID phrases like "this video shows" or any references to the video format
+7. Focus exclusively on the actual informational content
+
+## Output Format
+Produce a polished, standalone summary that presents the video's content clearly and comprehensively."""
+                        else:
+                            prompt = f"summarize: {combined_summaries}"
+                            
+                        final_summary_result = summarizer(
+                            prompt,
+                            max_length=max(250, max_summary_length * 2),  # Longer summary for better coverage
+                            min_length=max(150, max_summary_length),       # Ensure minimum length 
+                            do_sample=False,
+                            truncation=True
+                        )
+                        
+                        final_summary = final_summary_result[0]['summary_text']
+                        
+                        # Debug log the summary
+                        logger.info(f"Summary length before cleaning: {len(final_summary)} chars")
+                        
+                        # Clean the summary before returning
+                        cleaned_summary = self._clean_summary(final_summary)
+                        logger.info(f"Summary length after cleaning: {len(cleaned_summary)} chars")
+                        
+                        if not cleaned_summary:
+                            logger.warning("Warning: Cleaned summary is empty! Using original summary.")
+                            cleaned_summary = final_summary
+                            
+                        return cleaned_summary
+                        
+                    except Exception as e:
+                        logger.warning(f"Second-level summarization failed: {e}")
+                        logger.info("Falling back to simple join of summaries")
+                
+                # If second-level summarization wasn't done or failed, join with improved transitions
+                joined_summary = chunk_summaries[0]
+                for i in range(1, len(chunk_summaries)):
+                    # Don't repeat similar content in consecutive summaries
+                    current_summary = chunk_summaries[i]
+                    
+                    # Skip empty summaries
+                    if not current_summary.strip():
+                        continue
+                        
+                    # Try to avoid repetition by comparing words
+                    if len(joined_summary) > 0 and len(current_summary) > 0:
+                        prev_summary_words = set(joined_summary.lower().split()[-20:])
+                        current_summary_words = set(current_summary.lower().split()[:20])
+                        
+                        # If there's significant overlap, trim the current summary's beginning
+                        overlap = len(prev_summary_words.intersection(current_summary_words))
+                        if overlap > 5 and len(current_summary.split()) > 20:
+                            # Skip the first few words that might be redundant
+                            words_to_skip = min(10, len(current_summary.split()) // 4)
+                            current_summary = " ".join(current_summary.split()[words_to_skip:])
+                    
+                    # Add the current summary with appropriate transition
+                    joined_summary += " " + current_summary
+                
+                # Debug log the summary
+                logger.info(f"Summary length before cleaning: {len(joined_summary)} chars")
+                
+                cleaned_summary = self._clean_summary(joined_summary)
+                logger.info(f"Summary length after cleaning: {len(cleaned_summary)} chars")
+                
+                if not cleaned_summary:
+                    logger.warning("Warning: Cleaned summary is empty! Using original joined summary.")
+                    cleaned_summary = joined_summary
+                    
+                return cleaned_summary
+                
+            # If there's only one summary, return it
+            elif len(chunk_summaries) == 1:
+                logger.info(f"Using single chunk summary, length: {len(chunk_summaries[0])} chars")
+                cleaned_summary = self._clean_summary(chunk_summaries[0])
+                
+                if not cleaned_summary:
+                    logger.warning("Warning: Cleaned summary is empty! Using original summary.")
+                    cleaned_summary = chunk_summaries[0]
+                    
+                return cleaned_summary
+            
+            # If no summaries were generated, return a message
+            else:
+                logger.warning("No chunk summaries were generated!")
+                return "Could not generate a summary. The transcript might be too short or unclear."
+                
+        except Exception as e:
+            logger.error(f"Failed to generate summary: {str(e)}")
+            raise Exception(f"Failed to generate summary: {str(e)}")
+            
+    def _clean_summary(self, summary):
+        """
+        Clean the summary to remove any metadata artifacts or formatting instructions.
+        
+        Args:
+            summary (str): The raw summary to clean
+            
+        Returns:
+            str: The cleaned summary
+        """
+        if not summary:
+            logger.warning("Clean summary received empty input")
+            return ""
+            
+        logger.info(f"Cleaning summary of length {len(summary)} chars")
+            
+        # Remove common metadata markers
+        cleaned = summary
+        
+        # 1. Remove any numbered lists or bullet points
+        cleaned = re.sub(r'^[0-9]+\.\s+', '', cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r'^[-*•]\s+', '', cleaned, flags=re.MULTILINE)
+        
+        # 2. Remove any lines that look like formatting instructions
+        lines = cleaned.split('\n')
+        content_lines = []
+        for line in lines:
+            # Skip lines that look like metadata or instructions
+            if any(marker in line.lower() for marker in [
+                'duration:', 'tags:', 'summary:', 'perspective:', 'key features:',
+                'instruct', 'write', 'create', 'focus', 'provide'
+            ]) and len(line) < 60:
+                continue
+                
+            # Skip lines that are just formatting instructions
+            if any(phrase in line.lower() for phrase in [
+                'create a', 'write a', 'summary should', 'bullet point', 'dont include', 
+                "don't include", 'your summary', 'in paragraph form'
+            ]):
+                continue
+                
+            # Skip short metadata-like lines
+            if len(line.strip()) < 10 and (':' in line or line.strip().isdigit()):
+                continue
+                
+            content_lines.append(line)
+            
+        cleaned = '\n'.join(content_lines)
+        
+        # 3. Remove section markers completely
+        cleaned = cleaned.replace('First part:', '').replace('Next part:', '').replace('Final part:', '')
+        
+        # 4. Remove specific numbered instructions that might have leaked into the summary
+        for i in range(1, 15):  # Common instruction numbers
+            cleaned = re.sub(rf'{i}\.\s+[A-Z]', lambda match: match.group(0).replace(f"{i}. ", ""), cleaned)
+            
+        # 5. Remove instruction phrases that might have leaked into the summary
+        instruction_patterns = [
+            r'Your summary should.*$',
+            r'Create a cohesive.*$',
+            r'Focus ONLY on.*$',
+            r'Transcript excerpt:.*$',
+            r'Transcript chunks:.*$',
+            r'Write in paragraph.*$',
+            r'Do not include.*$',
+            r'INSTRUCTIONS:.*$',
+            r'Important:.*$'
+        ]
+        
+        for pattern in instruction_patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.MULTILINE)
+        
+        # 6. Collapse multiple whitespace
+        cleaned = re.sub(r'\n+', '\n', cleaned)  # Multiple newlines to single newline
+        cleaned = re.sub(r' +', ' ', cleaned)    # Multiple spaces to single space
+        
+        # 7. Remove any remaining numbering artifacts
+        cleaned = re.sub(r'^[0-9]+\)', '', cleaned, flags=re.MULTILINE)
+        
+        # 8. Remove meta phrases
+        meta_phrases = [
+            "in this video", "this video shows", "in this tutorial", 
+            "the video covers", "the video demonstrates",
+            "this tutorial", "in the video"
+        ]
+        
+        for phrase in meta_phrases:
+            # Case-insensitive replace at the start of the summary
+            pattern = re.compile(rf'^{phrase}', re.IGNORECASE)
+            cleaned = pattern.sub('', cleaned)
+            
+            # Replace elsewhere, preserving case context
+            pattern = re.compile(rf'\b{phrase}\b', re.IGNORECASE)
+            cleaned = pattern.sub('', cleaned)
+        
+        cleaned = cleaned.strip()
+        logger.info(f"Cleaned summary length: {len(cleaned)} chars") 
+        
+        return cleaned
+    
+    def _determine_optimal_chunk_size(self, model_name, default_size=1000):
+        """
+        Determine the optimal chunk size based on the model.
+        
+        Args:
+            model_name (str): Name of the model
+            default_size (int): Default chunk size
+            
+        Returns:
+            int: Optimal chunk size in words
+        """
+        # T5 models can generally handle longer contexts
+        if "t5" in model_name.lower():
+            if "flan-t5-xl" in model_name.lower() or "flan-t5-xxl" in model_name.lower():
+                return 1500
+            elif "flan-t5-large" in model_name.lower():
+                return 1200
+            else:
+                return 1000
+        # BART models have shorter context windows
+        elif "bart" in model_name.lower():
+            return 800
+        # Pegasus has medium context capability
+        elif "pegasus" in model_name.lower():
+            return 900
+        # Long-T5 is specifically designed for long contexts
+        elif "long-t5" in model_name.lower():
+            return 2500
+        else:
+            return default_size

@@ -1,0 +1,29 @@
+pytube>=12.1.0
+pydub>=0.25.1
+ffmpeg-python>=0.2.0
+torch>=2.0.0
+transformers>=4.34.0  # Newer version for better Whisper support
+accelerate>=0.20.0
+click>=8.1.3
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+sentencepiece>=0.1.99
+# Audio processing libraries
+scipy>=1.11.0
+librosa>=0.10.0  # Superior audio loading for Whisper
+soundfile>=0.12.1
+# For modern T5 models
+protobuf>=3.20.0
+sacremoses>=0.0.53
+# Optional but recommended for performance
+datasets>=2.14.0
+# New requirements for Audio RAG and Knowledge Graph
+faiss-cpu>=1.7.4  # Vector search library (precompiled binary) - replaces chromadb
+networkx>=3.1  # For knowledge graph implementation
+matplotlib>=3.7.1  # For graph visualization
+open_clip_torch>=2.20.0  # For CLAP-based audio embeddings
+numpy>=1.24.0  # Required for array operations
+pytest>=7.4.0  # For running tests
+langchain>=0.1.0  # For RAG components
+langchain-core>=0.1.0  # Core components for langchain
+yt-dlp>=2023.10.13  # YouTube download library (added to replace pytube)
