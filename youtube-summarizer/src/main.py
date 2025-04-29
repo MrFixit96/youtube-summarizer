@@ -86,6 +86,8 @@ def process_video(url, model_name=LOCAL_MODEL_NAME, rag_enabled=False, logger=No
             rag_pipeline = RagPipeline()
             
             # Process the video through RAG pipeline
+            # This stores the video content in the vector database and updates the knowledge graph
+            # to enhance future summaries with more contextual information
             rag_pipeline.process_new_video(
                 video_id=video_id,
                 audio_path=audio_path,
@@ -94,6 +96,8 @@ def process_video(url, model_name=LOCAL_MODEL_NAME, rag_enabled=False, logger=No
             )
             
             # Enhance the summary with RAG context
+            # This uses the existing knowledge base to add additional context
+            # and create a more comprehensive summary
             enhanced_summary = rag_pipeline.enhance_summary(
                 original_summary=summary,
                 video_id=video_id,
@@ -103,6 +107,7 @@ def process_video(url, model_name=LOCAL_MODEL_NAME, rag_enabled=False, logger=No
             logger.info("Summary enhanced with RAG")
             summary = enhanced_summary
         
+        # Return the results of the processing pipeline
         return True, {
             "video_path": video_path,
             "audio_path": audio_path,
